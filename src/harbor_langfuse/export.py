@@ -164,6 +164,18 @@ def trial_spans(trial_dir: Path, result: dict) -> ResourceSpans:
 
 # ---------------------------------------------------------------- one trial
 
+def task_instruction(trial_dir: Path) -> str | None:
+    """The task's instruction.md, from the task directory Harbor resolved for the trial."""
+    try:
+        from harbor.models.trial.config import TrialConfig
+
+        config = TrialConfig.model_validate_json((trial_dir / "config.json").read_text())
+        path = Path(config.task.get_local_path()) / "instruction.md"
+        return path.read_text().strip() or None
+    except Exception:  # noqa: BLE001 - fall back to the trajectory's first user message
+        return None
+
+
 def numeric_rewards(result: dict) -> dict[str, float]:
     rewards = ((result.get("verifier_result") or {}).get("rewards")) or {}
     return {k: float(v) for k, v in rewards.items() if isinstance(v, (int, float)) and not isinstance(v, bool)}
@@ -191,15 +203,23 @@ def _summarize(result: dict, trial_dir: Path, job_name: str, job_id: str | None,
                        agent=agent, model=model)
 
 
-def _ensure_item(client: LangfuseClient, ex: TrialExport, instruction: str | None, metadata: dict) -> None:
-    """Creates the task's dataset item, or updates it when the task changed. A trial without a trajectory
-    doesn't know the instruction, so it must not overwrite an item that has it."""
-    item_input = {"task": ex.task, "instruction": instruction} if instruction else {"task": ex.task}
+def _ensure_item(client: LangfuseClient, ex: TrialExport, task_text: str | None, first_message: str | None,
+                 metadata: dict) -> None:
+    """Creates the task's dataset item, or updates it when the task changed. The instruction is the task's
+    instruction.md; the trajectory's first user message stands in for it only on an item that has none,
+    because it differs per agent. A trial that knows neither must not overwrite an item that has one."""
     existing = client.get_item(ex.item_id)
-    if existing is not None and (not instruction or (existing.get("input") == item_input
-                                                     and existing.get("metadata") == metadata)):
-        return
-    client.upsert_item(ex.item_id, ex.dataset, item_input, metadata)
+    if existing is not None:
+        current = existing.get("input")
+        has_instruction = isinstance(current, dict) and bool(current.get("instruction"))
+        if task_text:
+            if current == {"task": ex.task, "instruction": task_text} and existing.get("metadata") == metadata:
+                return
+        elif has_instruction or not first_message:
+            return
+    instruction = task_text or first_message
+    client.upsert_item(ex.item_id, ex.dataset,
+                       {"task": ex.task, "instruction": instruction} if instruction else {"task": ex.task}, metadata)
 
 
 def export_trial(client: LangfuseClient, trial_dir: Path, *, job_name: str, job_id: str | None = None,
@@ -227,8 +247,9 @@ def export_trial(client: LangfuseClient, trial_dir: Path, *, job_name: str, job_
         root.status.CopyFrom(Status(code=Status.STATUS_CODE_ERROR, message=_error_message(exc, 1000)))
 
     dataset_id = (ensure_dataset or (lambda name: client.ensure_dataset(name)))(ex.dataset)
-    _ensure_item(client, ex, instruction, {"harbor_task": ex.task, "harbor_dataset": result.get("source"),
-                                           "task_checksum": result.get("task_checksum")})
+    _ensure_item(client, ex, task_instruction(trial_dir), instruction,
+                 {"harbor_task": ex.task, "harbor_dataset": result.get("source"),
+                  "task_checksum": result.get("task_checksum")})
 
     meta = {"harbor_job": job_name, "harbor_trial": ex.trial, "harbor_task": ex.task, "agent": ex.agent,
             "model": ex.model, "agent_version": (result.get("agent_info") or {}).get("version"),

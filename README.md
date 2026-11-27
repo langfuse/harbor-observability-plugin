@@ -75,7 +75,7 @@ Trials without a trajectory (for example Aider, or a trial that failed before th
 - Traces use the `sdk-experiment` environment, like experiments run with the Langfuse SDK.
 - Agent spans repeat the token usage and cost of their model calls. The plugin removes usage from all non-model spans so Langfuse doesn't count it twice.
 - IDs are deterministic: re-sending a job updates the same traces, dataset items and scores.
-- A dataset item is only written when it is new or its task changed, so a trial without a trajectory doesn't remove the instruction from the item.
+- A dataset item is only written when it is new or its task changed. Its instruction is the task's `instruction.md`; an agent's first message is only used for an item that has no instruction yet, and a trial without a trajectory never removes one.
 - The dataset name leaves out the dataset version, so all versions of a Harbor dataset share one Langfuse dataset.
 - Spans are sent with `x-langfuse-ingestion-version: 4`, which Langfuse needs to create experiment runs from OpenTelemetry spans.
 

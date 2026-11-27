@@ -301,3 +301,31 @@ def test_transient_errors_are_retried(monkeypatch):
     finally:
         srv.shutdown()
     assert waits == [3.0] and not replies
+
+
+def test_item_instruction_comes_from_the_task_not_the_trajectory(tmp_path, server):
+    # Codex, for example, sends an <environment_context> block as its first user message.
+    from harbor.models.trial.config import TaskConfig, TrialConfig
+
+    task_dir = tmp_path / "tasks" / "hello-world"
+    task_dir.mkdir(parents=True)
+    (task_dir / "instruction.md").write_text("Create hello.txt with the text hi.\n")
+    d = trial(tmp_path / "jobs")
+    traj = json.loads((d / "agent/trajectory.json").read_text())
+    traj["steps"][0]["message"] = "<environment_context><cwd>/app</cwd></environment_context>"
+    (d / "agent/trajectory.json").write_text(json.dumps(traj))
+    (d / "config.json").write_text(TrialConfig(task=TaskConfig(path=task_dir), trial_name=d.name).model_dump_json())
+    url, calls = server
+    export_trial(LangfuseClient(url, "pk", "sk"), d, job_name="my-job")
+    item = json.loads(next(c[3] for c in calls if c[1] == "/api/public/dataset-items"))
+    assert item["input"]["instruction"] == "Create hello.txt with the text hi."
+
+
+def test_another_agents_first_message_does_not_replace_the_instruction(tmp_path, server):
+    url, calls = server
+    client = LangfuseClient(url, "pk", "sk")
+    export_trial(client, trial(tmp_path, "hello-world__a"), job_name="my-job")
+    other = copy.deepcopy(TRAJECTORY)
+    other["steps"][0]["message"] = "<environment_context><cwd>/app</cwd></environment_context>"
+    export_trial(client, trial(tmp_path, "hello-world__b", trajectory=other), job_name="my-job")
+    assert [i["input"]["instruction"] for i in posts(calls, "/api/public/dataset-items")] == ["Create hello.txt"]
