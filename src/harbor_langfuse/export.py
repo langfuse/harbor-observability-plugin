@@ -15,9 +15,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
+import time
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from opentelemetry.proto.common.v1.common_pb2 import AnyValue, ArrayValue, KeyValue
@@ -30,6 +32,9 @@ NAMESPACE = uuid.UUID("9f3c7a52-6a7e-4f0e-9a43-5e2f7b6d0c11")
 EXPERIMENT_ENVIRONMENT = "sdk-experiment"  # the environment of Langfuse SDK experiment traces
 USAGE_PREFIXES = ("llm.token_count.", "llm.cost.", "gen_ai.usage.")
 LLM_KINDS = {"LLM"}
+MIN_TIME = 946_684_800 * 10**9  # 2000-01-01: an earlier span time means the trajectory had no timestamp
+
+logger = logging.getLogger("harbor_langfuse")
 
 
 @dataclass
@@ -42,8 +47,8 @@ class TrialExport:
     item_id: str
     experiment_id: str
     experiment_name: str
-    trace_id: str
-    root_observation_id: str
+    trace_id: str = ""  # empty for a trial that was only summarized, not sent
+    root_observation_id: str = ""
     rewards: dict = field(default_factory=dict)
     error: str | None = None
     agent: str = ""
@@ -63,9 +68,9 @@ def experiment_id_for(job_id: str, agent: str, model: str, dataset: str) -> str:
 
 
 def dataset_for(result: dict, job_name: str) -> str:
-    source = result.get("source")
-    if source and "/" in source:
-        return source.split("@")[0]
+    source = (result.get("source") or "").split("@")[0]  # without the version: one dataset across versions
+    if "/" in source:
+        return source
     return f"harbor/{source or job_name}"
 
 
@@ -108,7 +113,25 @@ def _drop_usage(span: Span) -> None:
 def _nanos(ts: str | None) -> int:
     if not ts:
         return 0
-    return int(datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp() * 1e9)
+    try:
+        dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    except ValueError:
+        return 0
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return int(dt.timestamp() * 1e9)
+
+
+def _trial_times(result: dict) -> tuple[int, int]:
+    """When the agent ran, for spans the trajectory gives no time; now if the result has none either."""
+    execution = result.get("agent_execution") or {}
+    start = _nanos(execution.get("started_at") or result.get("started_at")) or time.time_ns()
+    end = _nanos(execution.get("finished_at") or result.get("finished_at"))
+    return start, max(start, end)
+
+
+def _error_message(exc: dict, limit: int) -> str:
+    return f"{exc.get('exception_type')}: {str(exc.get('exception_message') or '')}"[:limit]
 
 
 def _fallback_spans(result: dict, trial: str) -> ResourceSpans:
@@ -116,15 +139,10 @@ def _fallback_spans(result: dict, trial: str) -> ResourceSpans:
     trace_id = hashlib.sha256(trial.encode()).digest()[:16]
     span_id = hashlib.sha256(("root\n" + trial).encode()).digest()[:8]
     agent = (result.get("config") or {}).get("agent") or {}
-    exc = result.get("exception_info") or {}
-    start = _nanos((result.get("agent_execution") or {}).get("started_at") or result.get("started_at"))
-    end = _nanos((result.get("agent_execution") or {}).get("finished_at") or result.get("finished_at")) or start
+    start, end = _trial_times(result)
     span = Span(trace_id=trace_id, span_id=span_id, name=agent.get("name") or "agent",
                 start_time_unix_nano=start, end_time_unix_nano=end,
                 attributes=[_kv("openinference.span.kind", "AGENT")])
-    if exc:
-        span.status.CopyFrom(Status(code=Status.STATUS_CODE_ERROR,
-                                    message=f"{exc.get('exception_type')}: {exc.get('exception_message', '')}"[:1000]))
     return ResourceSpans(resource=Resource(attributes=[_kv("service.name", "harbor")]),
                          scope_spans=[ScopeSpans(spans=[span])])
 
@@ -135,9 +153,12 @@ def trial_spans(trial_dir: Path, result: dict) -> ResourceSpans:
         try:
             from harbor_atif2otel.convert import convert_trajectory
 
-            return convert_trajectory(json.loads(traj_path.read_text()), trace_seed=trial_dir.name)
-        except Exception:  # noqa: BLE001 - an unreadable trajectory still gets a root span
-            pass
+            rs = convert_trajectory(json.loads(traj_path.read_text()), trace_seed=trial_dir.name)
+            if any(ss.spans for ss in rs.scope_spans):
+                return rs
+        except Exception as exc:  # noqa: BLE001 - an unreadable trajectory still gets a root span
+            logger.warning("harbor-langfuse: could not convert %s, sending the trial without its trajectory: %r",
+                           traj_path, exc)
     return _fallback_spans(result, trial_dir.name)
 
 
@@ -148,78 +169,102 @@ def numeric_rewards(result: dict) -> dict[str, float]:
     return {k: float(v) for k, v in rewards.items() if isinstance(v, (int, float)) and not isinstance(v, bool)}
 
 
-def export_trial(client: LangfuseClient, trial_dir: Path, *, job_name: str, job_id: str | None = None,
-                 dataset: str | None = None, run_name: str | None = None, tags: list[str] | None = None,
-                 ensure_dataset=None) -> TrialExport:
-    """Sends one finished trial to Langfuse and returns what was sent."""
-    result = json.loads((trial_dir / "result.json").read_text())
+def summarize_trial(trial_dir: Path, *, job_name: str, job_id: str | None = None, dataset: str | None = None,
+                    run_name: str | None = None) -> TrialExport:
+    """Where a finished trial belongs in Langfuse and how it scored, read from its result.json; sends nothing."""
+    return _summarize(json.loads((trial_dir / "result.json").read_text()), trial_dir, job_name, job_id, dataset,
+                      run_name)
+
+
+def _summarize(result: dict, trial_dir: Path, job_name: str, job_id: str | None, dataset: str | None,
+               run_name: str | None) -> TrialExport:
     config = result.get("config") or {}
     agent_cfg = config.get("agent") or {}
     agent, model = agent_cfg.get("name") or "agent", agent_cfg.get("model_name") or ""
     task = result.get("task_name") or trial_dir.name.split("__")[0]
     dataset = dataset or dataset_for(result, job_name)
     job_id = job_id or config.get("job_id") or job_name
-    experiment_id = experiment_id_for(job_id, agent, model, dataset)
-    experiment_name = run_name or f"{job_name} ({agent}, {short_model(model)})"
-    rewards = numeric_rewards(result)
+    return TrialExport(trial=trial_dir.name, task=task, dataset=dataset, item_id=item_id_for(dataset, task),
+                       experiment_id=experiment_id_for(job_id, agent, model, dataset),
+                       experiment_name=run_name or f"{job_name} ({agent}, {short_model(model)})",
+                       rewards=numeric_rewards(result), error=(result.get("exception_info") or {}).get("exception_type"),
+                       agent=agent, model=model)
+
+
+def _ensure_item(client: LangfuseClient, ex: TrialExport, instruction: str | None, metadata: dict) -> None:
+    """Creates the task's dataset item, or updates it when the task changed. A trial without a trajectory
+    doesn't know the instruction, so it must not overwrite an item that has it."""
+    item_input = {"task": ex.task, "instruction": instruction} if instruction else {"task": ex.task}
+    existing = client.get_item(ex.item_id)
+    if existing is not None and (not instruction or (existing.get("input") == item_input
+                                                     and existing.get("metadata") == metadata)):
+        return
+    client.upsert_item(ex.item_id, ex.dataset, item_input, metadata)
+
+
+def export_trial(client: LangfuseClient, trial_dir: Path, *, job_name: str, job_id: str | None = None,
+                 dataset: str | None = None, run_name: str | None = None, tags: list[str] | None = None,
+                 ensure_dataset=None) -> TrialExport:
+    """Sends one finished trial to Langfuse and returns what was sent."""
+    result = json.loads((trial_dir / "result.json").read_text())
+    ex = _summarize(result, trial_dir, job_name, job_id, dataset, run_name)
     exc = result.get("exception_info") or {}
 
     rs = trial_spans(trial_dir, result)
     spans = [s for ss in rs.scope_spans for s in ss.spans]
     root = next((s for s in spans if not s.parent_span_id), spans[0])
-    user_input = None
+    instruction = _attr(root, "input.value")
+    start, end = _trial_times(result)
     for s in spans:
-        if s is root:
-            user_input = _attr(s, "input.value")
         if _attr(s, "openinference.span.kind") not in LLM_KINDS:
             _drop_usage(s)
+        if s.start_time_unix_nano < MIN_TIME:  # a step without a timestamp would put the trace in 1970
+            s.start_time_unix_nano += start  # keeps the converter's small offsets between such spans
+        if s.end_time_unix_nano < MIN_TIME:
+            s.end_time_unix_nano += start
+        s.end_time_unix_nano = max(s.end_time_unix_nano, s.start_time_unix_nano)
+    if exc:
+        root.status.CopyFrom(Status(code=Status.STATUS_CODE_ERROR, message=_error_message(exc, 1000)))
 
-    dataset_id = (ensure_dataset or (lambda name: client.ensure_dataset(name)))(dataset)
-    item_id = item_id_for(dataset, task)
-    client.upsert_item(item_id, dataset, {"task": task, "instruction": user_input} if user_input else {"task": task},
-                       {"harbor_task": task, "harbor_dataset": result.get("source"),
-                        "task_checksum": result.get("task_checksum")})
+    dataset_id = (ensure_dataset or (lambda name: client.ensure_dataset(name)))(ex.dataset)
+    _ensure_item(client, ex, instruction, {"harbor_task": ex.task, "harbor_dataset": result.get("source"),
+                                           "task_checksum": result.get("task_checksum")})
 
-    meta = {"harbor_job": job_name, "harbor_trial": trial_dir.name, "harbor_task": task, "agent": agent,
-            "model": model, "agent_version": (result.get("agent_info") or {}).get("version"),
-            **{f"reward_{k}": v for k, v in rewards.items()}}
+    meta = {"harbor_job": job_name, "harbor_trial": ex.trial, "harbor_task": ex.task, "agent": ex.agent,
+            "model": ex.model, "agent_version": (result.get("agent_info") or {}).get("version"),
+            **{f"reward_{k}": v for k, v in ex.rewards.items()}}
     if exc:
         meta["exception"] = exc.get("exception_type")
-    _set(root, "langfuse.trace.name", task)
+    _set(root, "langfuse.trace.name", ex.task)
     for k, v in meta.items():
         if v is not None:
             _set(root, f"langfuse.trace.metadata.{k}", v)
-    _set(root, "langfuse.trace.tags", ["harbor", agent, *(tags or [])])
-    root_id = root.span_id.hex()
+    _set(root, "langfuse.trace.tags", ["harbor", ex.agent, *(tags or [])])
+    ex.trace_id, ex.root_observation_id = root.trace_id.hex(), root.span_id.hex()
     experiment_attrs = {
         "langfuse.environment": EXPERIMENT_ENVIRONMENT,
-        "langfuse.experiment.id": experiment_id,
-        "langfuse.experiment.name": experiment_name,
+        "langfuse.experiment.id": ex.experiment_id,
+        "langfuse.experiment.name": ex.experiment_name,
         "langfuse.experiment.dataset.id": dataset_id,
-        "langfuse.experiment.item.id": item_id,
-        "langfuse.experiment.item.root_observation_id": root_id,
+        "langfuse.experiment.item.id": ex.item_id,
+        "langfuse.experiment.item.root_observation_id": ex.root_observation_id,
         "langfuse.experiment.metadata.harbor_job": job_name,
-        "langfuse.experiment.metadata.agent": agent,
-        "langfuse.experiment.metadata.model": model,
+        "langfuse.experiment.metadata.agent": ex.agent,
+        "langfuse.experiment.metadata.model": ex.model,
     }
     for s in spans:  # like the SDK: every observation of the item carries the experiment attributes
         for k, v in experiment_attrs.items():
             _set(s, k, v)
     client.send_spans(rs)
 
-    trace_id = root.trace_id.hex()
-    for name, value in rewards.items():
-        client.score({"id": str(uuid.uuid5(NAMESPACE, f"{trial_dir.name}\n{name}")), "traceId": trace_id,
-                      "observationId": root_id, "name": name, "value": value, "environment": EXPERIMENT_ENVIRONMENT,
-                      "metadata": {"harbor_trial": trial_dir.name, "harbor_task": task}})
+    score = {"traceId": ex.trace_id, "observationId": ex.root_observation_id, "environment": EXPERIMENT_ENVIRONMENT}
+    for name, value in ex.rewards.items():
+        client.score({**score, "id": str(uuid.uuid5(NAMESPACE, f"{ex.trial}\n{name}")), "name": name, "value": value,
+                      "metadata": {"harbor_trial": ex.trial, "harbor_task": ex.task}})
     if exc:
-        client.score({"id": str(uuid.uuid5(NAMESPACE, f"{trial_dir.name}\ntrial_error")), "traceId": trace_id,
-                      "observationId": root_id, "name": "trial_error", "value": 1, "dataType": "BOOLEAN",
-                      "environment": EXPERIMENT_ENVIRONMENT, "comment": f"{exc.get('exception_type')}: "
-                      f"{str(exc.get('exception_message', ''))[:500]}"})
-    return TrialExport(trial=trial_dir.name, task=task, dataset=dataset, item_id=item_id, experiment_id=experiment_id,
-                       experiment_name=experiment_name, trace_id=trace_id, root_observation_id=root_id,
-                       rewards=rewards, error=exc.get("exception_type"), agent=agent, model=model)
+        client.score({**score, "id": str(uuid.uuid5(NAMESPACE, f"{ex.trial}\ntrial_error")), "name": "trial_error",
+                      "value": 1, "dataType": "BOOLEAN", "comment": _error_message(exc, 500)})
+    return ex
 
 
 def run_scores(client: LangfuseClient, exports: list[TrialExport]) -> list[dict]:
@@ -250,4 +295,4 @@ def trial_dirs(job_dir: Path) -> list[Path]:
     return sorted(d for d in job_dir.iterdir() if d.is_dir() and (d / "result.json").exists())
 
 
-__all__ = ["TrialExport", "export_trial", "run_scores", "item_id_for", "experiment_id_for", "trial_dirs", "job_name_of"]
+__all__ = ["TrialExport", "export_trial", "summarize_trial", "run_scores", "item_id_for", "experiment_id_for", "trial_dirs", "job_name_of"]
