@@ -143,6 +143,18 @@ def trial_spans(trial_dir: Path, result: dict) -> ResourceSpans:
 
 # ---------------------------------------------------------------- one trial
 
+def task_instruction(trial_dir: Path) -> str | None:
+    """The task's instruction.md, from the task directory Harbor resolved for the trial."""
+    try:
+        from harbor.models.trial.config import TrialConfig
+
+        config = TrialConfig.model_validate_json((trial_dir / "config.json").read_text())
+        path = Path(config.task.get_local_path()) / "instruction.md"
+        return path.read_text().strip() or None
+    except Exception:  # noqa: BLE001 - fall back to the trajectory's first user message
+        return None
+
+
 def numeric_rewards(result: dict) -> dict[str, float]:
     rewards = ((result.get("verifier_result") or {}).get("rewards")) or {}
     return {k: float(v) for k, v in rewards.items() if isinstance(v, (int, float)) and not isinstance(v, bool)}
@@ -176,7 +188,8 @@ def export_trial(client: LangfuseClient, trial_dir: Path, *, job_name: str, job_
 
     dataset_id = (ensure_dataset or (lambda name: client.ensure_dataset(name)))(dataset)
     item_id = item_id_for(dataset, task)
-    client.upsert_item(item_id, dataset, {"task": task, "instruction": user_input} if user_input else {"task": task},
+    instruction = task_instruction(trial_dir) or user_input
+    client.upsert_item(item_id, dataset, {"task": task, "instruction": instruction} if instruction else {"task": task},
                        {"harbor_task": task, "harbor_dataset": result.get("source"),
                         "task_checksum": result.get("task_checksum")})
 
