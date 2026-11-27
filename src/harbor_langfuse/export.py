@@ -6,7 +6,7 @@ nothing else has to be created: the trial's trace *is* the item's result.
 
     dataset       the trial's Harbor dataset (result.json "source"), or harbor/<job name>
     dataset item  one per task, id derived from dataset and task name (stable across jobs)
-    experiment    one run per job, agent and model
+    experiment    one run per job, agent, model and dataset
     trace         the agent trajectory (harbor-atif2otel's conversion), root = AGENT span
     scores        each numeric verifier reward on the trace's root observation
 """
@@ -56,9 +56,10 @@ def item_id_for(dataset: str, task: str) -> str:
     return str(uuid.uuid5(NAMESPACE, f"{dataset}\n{task}"))
 
 
-def experiment_id_for(job_id: str, agent: str, model: str) -> str:
-    # 16 hex characters, like the ids the Langfuse SDK gives experiment runs.
-    return hashlib.sha256(f"{job_id}\n{agent}\n{model}".encode()).hexdigest()[:16]
+def experiment_id_for(job_id: str, agent: str, model: str, dataset: str) -> str:
+    # 16 hex characters, like the ids the Langfuse SDK gives experiment runs. A run belongs to one
+    # dataset, so a job over several Harbor datasets gives one run per dataset.
+    return hashlib.sha256(f"{job_id}\n{agent}\n{model}\n{dataset}".encode()).hexdigest()[:16]
 
 
 def dataset_for(result: dict, job_name: str) -> str:
@@ -158,7 +159,7 @@ def export_trial(client: LangfuseClient, trial_dir: Path, *, job_name: str, job_
     task = result.get("task_name") or trial_dir.name.split("__")[0]
     dataset = dataset or dataset_for(result, job_name)
     job_id = job_id or config.get("job_id") or job_name
-    experiment_id = experiment_id_for(job_id, agent, model)
+    experiment_id = experiment_id_for(job_id, agent, model, dataset)
     experiment_name = run_name or f"{job_name} ({agent}, {short_model(model)})"
     rewards = numeric_rewards(result)
     exc = result.get("exception_info") or {}

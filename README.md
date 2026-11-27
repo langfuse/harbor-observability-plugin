@@ -6,7 +6,7 @@ A [Harbor](https://github.com/harbor-framework/harbor) plugin that sends agent e
 | --------------- | -------------------------------------------------------------------------------- |
 | dataset         | dataset, named after the Harbor dataset (for example `terminal-bench/terminal-bench-2-1`) |
 | task            | dataset item, the same in every job                                              |
-| job             | one experiment run per agent and model                                           |
+| job             | one experiment run per agent and model (per dataset if the job has several)     |
 | trial           | trace: one generation per model call, one tool observation per tool call         |
 | verifier reward | score on the trace, plus `mean_<reward>` and `error_rate` on the run             |
 

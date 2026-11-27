@@ -102,7 +102,7 @@ def test_trial_becomes_an_experiment_item_with_linked_trace_and_scores(tmp_path,
     for s in spans:
         a = attrs(s)
         assert a["langfuse.environment"] == "sdk-experiment"
-        assert a["langfuse.experiment.id"] == experiment_id_for("job-1", "terminus-2", "anthropic/claude-sonnet-5-5")
+        assert a["langfuse.experiment.id"] == experiment_id_for("job-1", "terminus-2", "anthropic/claude-sonnet-5-5", "harbor/hello-world")
         assert a["langfuse.experiment.item.id"] == item_id_for("harbor/hello-world", "hello-world/hello-world")
         assert a["langfuse.experiment.item.root_observation_id"] == root.span_id.hex()
         assert a["langfuse.experiment.dataset.id"] == "ds-1"
@@ -137,5 +137,6 @@ def test_run_scores_average_rewards_per_run(tmp_path, server):
 
 def test_ids_are_stable_across_jobs():
     assert item_id_for("harbor/hello-world", "t") == item_id_for("harbor/hello-world", "t")
-    assert experiment_id_for("job-1", "a", "m") != experiment_id_for("job-2", "a", "m")
-    assert len(experiment_id_for("job-1", "a", "m")) == 16
+    assert experiment_id_for("job-1", "a", "m", "d") != experiment_id_for("job-2", "a", "m", "d")
+    assert experiment_id_for("job-1", "a", "m", "d1") != experiment_id_for("job-1", "a", "m", "d2")
+    assert len(experiment_id_for("job-1", "a", "m", "d")) == 16
