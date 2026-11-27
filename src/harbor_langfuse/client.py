@@ -7,17 +7,47 @@ import json
 import os
 import time
 import urllib.parse
+from collections.abc import Iterator
+from http.client import HTTPException
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from opentelemetry.proto.collector.trace.v1.trace_service_pb2 import ExportTraceServiceRequest
-from opentelemetry.proto.trace.v1.trace_pb2 import ResourceSpans
+from opentelemetry.proto.trace.v1.trace_pb2 import ResourceSpans, ScopeSpans
 
 RETRY_STATUS = {408, 409, 429, 500, 502, 503, 504}
+MAX_BACKOFF = 10.0
+MAX_OTLP_BYTES = 3_000_000  # stay well below Langfuse's request body limit
 
 
 class LangfuseError(RuntimeError):
-    pass
+    def __init__(self, message: str, status: int | None = None):
+        super().__init__(message)
+        self.status = status  # the HTTP status, if Langfuse answered
+
+
+def _retry_after(exc: HTTPError) -> float | None:
+    try:
+        return max(0.0, float(exc.headers.get("Retry-After", "")))
+    except (TypeError, ValueError, AttributeError):
+        return None
+
+
+def span_batches(resource_spans: ResourceSpans, max_bytes: int = MAX_OTLP_BYTES) -> Iterator[ResourceSpans]:
+    """Splits a trial's spans into requests of about max_bytes; a long trajectory is too large for one."""
+    for scope_spans in resource_spans.scope_spans:
+        batch, size = [], 0
+        for span in scope_spans.spans:
+            span_size = span.ByteSize()
+            if batch and size + span_size > max_bytes:
+                yield ResourceSpans(resource=resource_spans.resource,
+                                    scope_spans=[ScopeSpans(scope=scope_spans.scope, spans=batch)])
+                batch, size = [], 0
+            batch.append(span)
+            size += span_size
+        if batch:
+            yield ResourceSpans(resource=resource_spans.resource,
+                                scope_spans=[ScopeSpans(scope=scope_spans.scope, spans=batch)])
 
 
 class LangfuseClient:
@@ -37,6 +67,8 @@ class LangfuseClient:
     # -- transport
     def _request(self, method: str, path: str, data: bytes | None, headers: dict, attempts: int = 4) -> bytes:
         for attempt in range(attempts):
+            last = attempt == attempts - 1
+            delay = min(2.0 ** attempt, MAX_BACKOFF)
             req = Request(self.base_url + path, data=data, method=method,
                           headers={"Authorization": self._auth, **headers})
             try:
@@ -44,26 +76,33 @@ class LangfuseClient:
                     return resp.read()
             except HTTPError as exc:
                 body = exc.read()[:300]
-                if exc.code not in RETRY_STATUS or attempt == attempts - 1:
-                    raise LangfuseError(f"{method} {path}: HTTP {exc.code} {body!r}") from exc
-            except (URLError, TimeoutError, ConnectionError) as exc:
-                if attempt == attempts - 1:
-                    raise LangfuseError(f"{method} {path}: {exc}") from exc
-            time.sleep(min(2 ** attempt, 10))
+                if exc.code not in RETRY_STATUS or last:
+                    raise LangfuseError(f"{method} {path}: HTTP {exc.code} {body!r}", status=exc.code) from exc
+                delay = min(_retry_after(exc) or delay, MAX_BACKOFF)
+            except (URLError, HTTPException, TimeoutError, ConnectionError) as exc:
+                if last:
+                    raise LangfuseError(f"{method} {path}: {exc!r}") from exc
+            time.sleep(delay)
         raise AssertionError("unreachable")
 
     def api(self, method: str, path: str, body: dict | None = None) -> dict:
         raw = self._request(method, path, json.dumps(body).encode() if body is not None else None,
                             {"Content-Type": "application/json"})
-        return json.loads(raw) if raw else {}
+        if not raw:
+            return {}
+        try:
+            return json.loads(raw)
+        except ValueError as exc:  # e.g. the HTML page of a proxy or a wrong base URL
+            raise LangfuseError(f"{method} {path}: response is not JSON: {raw[:200]!r}") from exc
 
     def send_spans(self, resource_spans: ResourceSpans) -> None:
         """OTLP/HTTP protobuf. x-langfuse-ingestion-version 4 asks for Langfuse v4 processing:
         without it Langfuse Cloud takes the older batch path, where experiment attributes
         are not turned into experiment runs."""
-        body = ExportTraceServiceRequest(resource_spans=[resource_spans]).SerializeToString()
-        self._request("POST", "/api/public/otel/v1/traces", body,
-                      {"Content-Type": "application/x-protobuf", "x-langfuse-ingestion-version": "4"})
+        for batch in span_batches(resource_spans):
+            body = ExportTraceServiceRequest(resource_spans=[batch]).SerializeToString()
+            self._request("POST", "/api/public/otel/v1/traces", body,
+                          {"Content-Type": "application/x-protobuf", "x-langfuse-ingestion-version": "4"})
 
     # -- resources
     def check(self) -> dict:
@@ -74,13 +113,24 @@ class LangfuseClient:
         try:
             return self.api("GET", path)["id"]
         except LangfuseError as exc:
-            if "HTTP 404" not in str(exc):
+            if exc.status != 404:
                 raise
         body = {"name": name, "description": description, "metadata": metadata or {}}
         try:
             return self.api("POST", "/api/public/v2/datasets", body)["id"]
-        except LangfuseError:
-            return self.api("GET", path)["id"]  # created concurrently
+        except LangfuseError as create_error:
+            try:
+                return self.api("GET", path)["id"]  # created concurrently
+            except LangfuseError:
+                raise create_error from None  # the reason the dataset could not be created
+
+    def get_item(self, item_id: str) -> dict | None:
+        try:
+            return self.api("GET", "/api/public/dataset-items/" + urllib.parse.quote(item_id, safe=""))
+        except LangfuseError as exc:
+            if exc.status == 404:
+                return None
+            raise
 
     def upsert_item(self, item_id: str, dataset_name: str, input: object, metadata: dict) -> None:
         self.api("POST", "/api/public/dataset-items",

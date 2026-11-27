@@ -38,7 +38,7 @@ harbor run -d terminal-bench/terminal-bench-2-1 \
   --plugin langfuse
 ```
 
-Each trial is sent when it ends; run-level scores are sent when the job ends. A failed export logs a warning and never fails the job.
+Each trial is sent when it ends; run-level scores are sent when the job ends. A failed export logs a warning and never fails the job. If you resume a job, only its new trials are sent, and the run-level scores are recalculated over all trials of the job.
 
 Options, passed with `--pk key=value`:
 
@@ -55,6 +55,8 @@ To send a job that already ran:
 harbor-langfuse export jobs/<job-name>
 ```
 
+The command exits with a non-zero status if a trial could not be sent; the other trials are still sent.
+
 ## What you see per agent
 
 Traces are built from the trajectory the agent writes (`agent/trajectory.json`), converted with [`harbor-atif2otel`](https://pypi.org/project/harbor-atif2otel/). What a trace shows depends on what the agent records:
@@ -66,13 +68,15 @@ Traces are built from the trajectory the agent writes (`agent/trajectory.json`),
 | OpenHands SDK                            | yes         | no              |
 | Goose                                    | no          | no              |
 
-Trials without a trajectory (for example Aider, or a trial that failed before the agent ran) appear as a single observation, marked as an error if the trial failed, so they still count in the run. Trajectories don't record tool call durations.
+Trials without a trajectory (for example Aider, or a trial that failed before the agent ran) appear as a single observation, so they still count in the run. The trace of a failed trial is marked as an error, with or without a trajectory. Trajectories don't record tool call durations.
 
 ## Details
 
 - Traces use the `sdk-experiment` environment, like experiments run with the Langfuse SDK.
 - Agent spans repeat the token usage and cost of their model calls. The plugin removes usage from all non-model spans so Langfuse doesn't count it twice.
 - IDs are deterministic: re-sending a job updates the same traces, dataset items and scores.
+- A dataset item is only written when it is new or its task changed. Its instruction is the task's `instruction.md`; an agent's first message is only used for an item that has no instruction yet, and a trial without a trajectory never removes one.
+- The dataset name leaves out the dataset version, so all versions of a Harbor dataset share one Langfuse dataset.
 - Spans are sent with `x-langfuse-ingestion-version: 4`, which Langfuse needs to create experiment runs from OpenTelemetry spans.
 
 ## Development
